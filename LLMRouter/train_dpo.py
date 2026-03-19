@@ -218,6 +218,24 @@ def train(args):
     train_dataset, val_dataset = build_dataset(pairs, tokenizer, val_ratio=0.1)
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
+    # TRL API compatibility: DPO-specific args (beta, max_length, etc.) moved into
+    # DPOConfig in TRL ≥ 0.9.  Older versions expect them on DPOTrainer directly.
+    # We detect which params DPOConfig accepts and route accordingly.
+    import inspect
+    _dpo_config_params = inspect.signature(DPOConfig.__init__).parameters
+    _dpo_specific = {
+        "beta":             args.beta,
+        "loss_type":        "sigmoid",
+        "max_length":       args.max_length,
+        "max_prompt_length": args.max_prompt_length,
+        "label_smoothing":  0.0,
+    }
+    _in_config  = {k: v for k, v in _dpo_specific.items() if k in _dpo_config_params}
+    _in_trainer = {k: v for k, v in _dpo_specific.items() if k not in _dpo_config_params}
+    if _in_trainer:
+        import trl as _trl
+        print(f"[compat] TRL {_trl.__version__}: passing {list(_in_trainer)} to DPOTrainer (not in DPOConfig).")
+
     dpo_config = DPOConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -229,7 +247,7 @@ def train(args):
         warmup_ratio=0.1,
         bf16=not args.smoke_test,
         fp16=False,
-        gradient_checkpointing=not args.smoke_test,  # saves ~30% activation memory on 4090
+        gradient_checkpointing=not args.smoke_test,
         logging_steps=1 if args.smoke_test else 10,
         eval_strategy="steps",
         eval_steps=5 if args.smoke_test else 25,
@@ -239,25 +257,21 @@ def train(args):
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        report_to="none",           # swap to "wandb" for W&B logging
+        report_to="none",
         remove_unused_columns=False,
-        dataloader_num_workers=0,   # avoid multiprocessing issues with QLoRA
-        deepspeed=args.deepspeed,   # None for single GPU, path for multi-GPU ZeRO-2
-        # DPO-specific
-        beta=args.beta,
-        loss_type="sigmoid",
-        max_length=args.max_length,
-        max_prompt_length=args.max_prompt_length,
-        label_smoothing=0.0,
+        dataloader_num_workers=0,
+        deepspeed=args.deepspeed,
+        **_in_config,
     )
 
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,      # None = use implicit reference via PEFT (memory-efficient)
+        ref_model=None,
         args=dpo_config,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
+        **_in_trainer,
     )
 
     print("Starting DPO training...")
