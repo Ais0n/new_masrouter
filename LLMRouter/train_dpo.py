@@ -218,23 +218,37 @@ def train(args):
     train_dataset, val_dataset = build_dataset(pairs, tokenizer, val_ratio=0.1)
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-    # TRL API compatibility: DPO-specific args (beta, max_length, etc.) moved into
-    # DPOConfig in TRL ≥ 0.9.  Older versions expect them on DPOTrainer directly.
-    # We detect which params DPOConfig accepts and route accordingly.
+    # ── TRL version compatibility ──────────────────────────────────────────────
     import inspect
-    _dpo_config_params = inspect.signature(DPOConfig.__init__).parameters
+    import trl as _trl
+    print(f"TRL version: {_trl.__version__}")
+
+    # 1. tokenizer kwarg renamed to processing_class in TRL >= 0.9
+    _trainer_sig = inspect.signature(DPOTrainer.__init__).parameters
+    _tokenizer_kwarg = "processing_class" if "processing_class" in _trainer_sig else "tokenizer"
+
+    # 2. DPO-specific args (beta, max_length, etc.) live in DPOConfig in newer TRL
+    #    but in DPOTrainer in older TRL.  DPOConfig uses **kwargs internally so
+    #    inspect misses them — probe by actually instantiating DPOConfig.
     _dpo_specific = {
-        "beta":             args.beta,
-        "loss_type":        "sigmoid",
-        "max_length":       args.max_length,
+        "beta":              args.beta,
+        "loss_type":         "sigmoid",
+        "max_length":        args.max_length,
         "max_prompt_length": args.max_prompt_length,
-        "label_smoothing":  0.0,
+        "label_smoothing":   0.0,
     }
-    _in_config  = {k: v for k, v in _dpo_specific.items() if k in _dpo_config_params}
-    _in_trainer = {k: v for k, v in _dpo_specific.items() if k not in _dpo_config_params}
+    _in_config, _in_trainer = {}, {}
+    for _k, _v in _dpo_specific.items():
+        try:
+            DPOConfig(output_dir="/tmp/_probe", **{_k: _v})
+            _in_config[_k] = _v
+        except TypeError:
+            if _k in _trainer_sig:
+                _in_trainer[_k] = _v
+            else:
+                print(f"  [compat] '{_k}' not accepted by DPOConfig or DPOTrainer — skipping.")
     if _in_trainer:
-        import trl as _trl
-        print(f"[compat] TRL {_trl.__version__}: passing {list(_in_trainer)} to DPOTrainer (not in DPOConfig).")
+        print(f"  [compat] passing {list(_in_trainer)} to DPOTrainer instead of DPOConfig.")
 
     dpo_config = DPOConfig(
         output_dir=args.output_dir,
@@ -270,7 +284,7 @@ def train(args):
         args=dpo_config,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        tokenizer=tokenizer,
+        **{_tokenizer_kwarg: tokenizer},
         **_in_trainer,
     )
 
