@@ -1,0 +1,95 @@
+name: masrouter
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - scipy
+  - networkx
+  - pillow
+  - pyyaml
+  - tqdm
+  - requests
+  - loguru
+  - tenacity
+  - tiktoken
+  - tokenizers
+  - datasets
+  - huggingface_hub
+  - safetensors
+  - openai
+  - httpx
+  - python-dotenv
+  - packaging
+  - regex
+  - click
+  - six
+  - certifi
+  - charset-normalizer
+  - idna
+  - urllib3
+  - joblib
+  - sympy
+  - mpmath
+  - pytz
+  - python-dateutil
+  - pycparser
+  - cffi
+  - sqlalchemy
+  - jinja2
+  - pip:
+      - annotated-types
+      - anyio
+      - class-registry
+      - dataclasses-json
+      - groq
+      - httpx-sse
+      - jsonpatch
+      - jsonpointer
+      - langchain
+      - langchain-community
+      - langchain-core
+      - langchain-text-splitters
+      - langsmith
+      - markupsafe
+      - marshmallow==3.26.1
+      - mypy-extensions
+      - orjson
+      - pydantic
+      - pydantic-settings
+      - requests-toolbelt
+      - shortuuid
+      - sniffio
+      - typing-inspect
+      - typing-inspection
+      - zstandard
+      # PyTorch with CUDA 13.0 support (for CUDA 13.x systems)
+      # Install via: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.10.0+cu130
+      - torchvision==0.25.0+cu130
+      - transformers==4.49.0
+      - sentence-transformers
+      # Document/file readers
+      - beautifulsoup4
+      - python-pptx
+      - python-docx
+      - PyPDF2
+      - openpyxl
+      - markdown
+      - pylatexenc
+      # Search / web tools
+      - wikipedia
+      - arxiv
+      - google-api-python-client
+      - pytube
+      # API server
+      - fastapi
+      # Code tools
+      - astunparse
