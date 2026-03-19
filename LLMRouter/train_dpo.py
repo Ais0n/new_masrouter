@@ -10,7 +10,7 @@ The router learns to:
   - rejected: routing decisions that propagate errors or delay recovery
 
 Architecture:
-  Base:   Qwen/Qwen3.5-27B-Instruct  (or any Qwen3.x instruct model)
+  Base:   Qwen/Qwen3-30B-A3B-Instruct-2507  (MoE: 30B total / 3B active, fits 4×RTX4090)
   Adapt:  QLoRA (4-bit NF4 + BF16 compute) via bitsandbytes
   Train:  TRL DPOTrainer with beta=0.1, sigmoid loss
 
@@ -51,7 +51,7 @@ from transformers import (
 from trl import DPOConfig, DPOTrainer
 
 # ── Defaults ────────────────────────────────────────────────────────────────────
-DEFAULT_MODEL   = "Qwen/Qwen3.5-27B-Instruct"
+DEFAULT_MODEL   = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 DEFAULT_OUTPUT  = "checkpoints/llm_router_dpo"
 SYSTEM_PROMPT   = (
     "You are an expert MAS routing advisor. "
