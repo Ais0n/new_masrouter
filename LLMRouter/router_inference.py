@@ -29,7 +29,10 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from LLMRouter.train_dpo import SYSTEM_PROMPT
+try:
+    from LLMRouter.train_dpo import SYSTEM_PROMPT
+except ModuleNotFoundError:
+    from train_dpo import SYSTEM_PROMPT
 
 # ── Valid routing vocabulary (mirrors MASRouter) ────────────────────────────────
 VALID_MODES = {"IO", "CoT", "Chain", "FullConnected", "Debate", "Reflection"}
