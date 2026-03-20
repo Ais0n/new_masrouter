@@ -186,7 +186,7 @@ class LLMRouter:
     def __init__(
         self,
         adapter_path: str,
-        base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        base_model: str = "Qwen/Qwen3-4B-Instruct-2507",
         device: str = "auto",
         max_new_tokens: int = 256,
         temperature: float = 0.1,   # low temperature for deterministic JSON output
@@ -262,7 +262,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter",     required=True, help="Path to saved LoRA adapter dir.")
-    parser.add_argument("--base-model",  default="Qwen/Qwen3-30B-A3B-Instruct-2507")
+    parser.add_argument("--base-model",  default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--query",       required=True, help="Task query string.")
     parser.add_argument("--coarse-type", default=None,
                         help="Coarse error type (omit for initial routing).")
