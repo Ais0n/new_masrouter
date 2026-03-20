@@ -170,6 +170,25 @@ def parse_routing_decision(raw: str) -> dict:
             # Try prefix matching (e.g. "gpt-4o-mini" → "openai/gpt-4o-mini")
             match = next((v for v in VALID_LLMS if llm in v), "openai/gpt-4o-mini")
             repaired_llms.append(match)
+
+    # Deduplicate: if model repeated the same LLM, fill gaps from default pool
+    if len(set(repaired_llms)) < len(repaired_llms):
+        default_pool = ["openai/gpt-4o-mini", "google/gemini-2.0-flash-001",
+                        "deepseek/deepseek-chat", "meta-llama/llama-3.1-70b-instruct",
+                        "anthropic/claude-3.5-haiku"]
+        seen, deduped = set(), []
+        for llm in repaired_llms:
+            if llm not in seen:
+                seen.add(llm)
+                deduped.append(llm)
+        for llm in default_pool:
+            if len(deduped) >= n:
+                break
+            if llm not in seen:
+                seen.add(llm)
+                deduped.append(llm)
+        repaired_llms = deduped[:n]
+
     d["llms"] = repaired_llms
 
     if "rationale" not in d or not d["rationale"]:
@@ -208,7 +227,7 @@ class LLMRouter:
         base = AutoModelForCausalLM.from_pretrained(
             base_model,
             device_map=device,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
         )
         print(f"Loading LoRA adapter from {adapter_path}...")
