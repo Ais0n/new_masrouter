@@ -165,7 +165,7 @@ def load_model_and_tokenizer(model_name: str, smoke_test: bool = False):
         device_map=device_map,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",  # remove if FlashAttn2 not installed
+        # attn_implementation="flash_attention_2",  # requires flash-attn package
     )
     model = prepare_model_for_kbit_training(
         model,
