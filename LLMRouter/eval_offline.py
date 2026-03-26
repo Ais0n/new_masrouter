@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Offline Routing Accuracy Evaluation for LLMRouter.
+Offline Evaluation for SDPO v3 LLMRouter.
 
-Holds out the same 10 % validation split used during DPO training (seed=42),
-runs LLMRouter on every prompt (blind — no access to chosen/rejected),
-then compares the predicted routing to the oracle (the 'chosen' label).
+In SDPO v3 chosen/rejected are plain trajectory-segment strings, not routing
+config JSON.  This script evaluates whether the fine-tuned model generates
+trajectory continuations that look like the CHOSEN (containment) side rather
+than the REJECTED (propagation) side.
 
-Metrics reported
-────────────────
-  • Mode accuracy          – predicted collaboration_mode == oracle mode
-  • n_agents accuracy      – predicted num_agents == oracle num_agents
-  • Joint accuracy         – both mode and n_agents correct
-  • Per-coarse accuracy    – breakdown by coarse_type
-  • Confusion matrix       – oracle mode (row) × predicted mode (col)
-  • Mode distribution      – oracle vs predicted frequency per mode
-  • Repair rate            – fraction of outputs that needed post-hoc repair
+Metrics
+───────
+  format_valid    – output contains at least one "Step N (Role):" line
+  containment_kw  – output uses recovery language (verifier catching error)
+                    vs propagation language (passing error unchanged)
+  prefer_chosen   – output is lexically closer to chosen than rejected
+                    (bigram Jaccard similarity)
+  repair_rate     – fraction of outputs that were empty or malformed
 
-Usage (run from new_masrouter/):
+Usage (run from masrouter/):
   python LLMRouter/eval_offline.py \\
-    --adapter  checkpoints/llm_router_dpo/final \\
-    --data     ../MAST-Data/output/dpo_pairs/dpo_pairs_combined.jsonl \\
-    [--val-ratio 0.1] [--seed 42] [--output eval_offline_results.json]
+    --adapter  checkpoints/llm_router_sdpo_v3/final \\
+    --data     ../MAST-Data/output/dpo_pairs/sdpo_pairs_v3.jsonl \\
+    [--val-ratio 0.1] [--seed 42] [--output eval_sdpo_results.json]
 """
 
 from __future__ import annotations
@@ -28,25 +28,72 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
-# ── import router ────────────────────────────────────────────────────────────
 try:
-    from LLMRouter.router_inference import LLMRouter, parse_routing_decision
+    from LLMRouter.train_dpo import SYSTEM_PROMPT
 except ModuleNotFoundError:
-    from router_inference import LLMRouter, parse_routing_decision
+    from train_dpo import SYSTEM_PROMPT
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── Text-similarity helpers ────────────────────────────────────────────────────
 
-ALL_MODES = ["IO", "CoT", "Chain", "FullConnected", "Debate", "Reflection"]
+def bigrams(text: str) -> set:
+    tokens = re.findall(r"\w+", text.lower())
+    return set(zip(tokens, tokens[1:])) if len(tokens) > 1 else set()
 
+
+def jaccard(a: str, b: str) -> float:
+    ba, bb = bigrams(a), bigrams(b)
+    if not ba and not bb:
+        return 0.0
+    return len(ba & bb) / len(ba | bb)
+
+
+# ── SDPO-specific metrics ──────────────────────────────────────────────────────
+
+STEP_RE = re.compile(r"Step\s+\d+\s*\(", re.IGNORECASE)
+
+CONTAINMENT_KW = {
+    "verify", "verif", "correct", "correcting", "correction", "fix", "fixing",
+    "catch", "catching", "detect", "error caught", "mistake", "wrong answer",
+    "re-check", "recheck", "review", "confirms", "accurate", "confirmed",
+    "right answer", "actual answer", "should be",
+}
+
+PROPAGATION_KW = {
+    "passes", "passing", "forwarding", "forward", "unchanged",
+    "submit", "submitting", "final answer", "finaliz", "output the answer",
+    "accepts", "accepted", "uses the result", "sends the result",
+    "does not check", "without checking", "without verification",
+}
+
+
+def containment_score(text: str) -> float:
+    """
+    +1 for each containment keyword hit, -1 for each propagation keyword hit.
+    Normalised to [-1, +1]. +1 = pure containment, -1 = pure propagation.
+    """
+    t = text.lower()
+    pos = sum(1 for kw in CONTAINMENT_KW if kw in t)
+    neg = sum(1 for kw in PROPAGATION_KW if kw in t)
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return (pos - neg) / total
+
+
+def format_valid(text: str) -> bool:
+    return bool(STEP_RE.search(text or ""))
+
+
+# ── Data loading ───────────────────────────────────────────────────────────────
 
 def load_val_split(data_path: str, val_ratio: float, seed: int) -> List[dict]:
-    """Reproduce the exact val split used by train_dpo.py."""
     random.seed(seed)
     pairs = [json.loads(l) for l in open(data_path, encoding="utf-8") if l.strip()]
     random.shuffle(pairs)
@@ -54,37 +101,34 @@ def load_val_split(data_path: str, val_ratio: float, seed: int) -> List[dict]:
     return pairs[:n_val]
 
 
-def extract_prompt_text(pair: dict) -> str:
-    """Return the raw prompt string from a DPO pair."""
-    return pair["prompt"]
+# ── Inference ──────────────────────────────────────────────────────────────────
 
-
-def oracle_mode(pair: dict) -> str:
-    return json.loads(pair["chosen"])["collaboration_mode"]
-
-
-def oracle_n(pair: dict) -> int:
-    return json.loads(pair["chosen"])["num_agents"]
-
-
-def confusion_matrix_str(matrix: dict, modes: List[str]) -> str:
-    """Pretty-print confusion matrix (oracle rows × predicted cols)."""
-    active = [m for m in modes if any(matrix[m][p] for p in modes)]
-    if not active:
-        return "(empty)"
-    col_w = max(len(m) for m in active) + 2
-    header = " " * col_w + "".join(f"{m:>{col_w}}" for m in active) + "  ← PREDICTED"
-    rows = [header, "-" * len(header)]
-    for oracle_m in active:
-        row = f"{oracle_m:<{col_w}}" + "".join(
-            f"{matrix[oracle_m][p]:>{col_w}}" for p in active
+def run_inference(pair: dict, router) -> str:
+    import torch
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": pair["prompt"]},
+    ]
+    text = router.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = router.tokenizer(
+        text, return_tensors="pt", truncation=True, max_length=3200
+    ).to(router.model.device)
+    with torch.inference_mode():
+        outputs = router.model.generate(
+            **inputs,
+            max_new_tokens=400,
+            do_sample=False,
+            pad_token_id=router.tokenizer.pad_token_id,
         )
-        rows.append(row)
-    rows.append("↑ ORACLE")
-    return "\n".join(rows)
+    new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+    return router.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
-def accuracy_bar(correct: int, total: int, width: int = 30) -> str:
+# ── Accuracy bar ──────────────────────────────────────────────────────────────
+
+def acc_bar(correct: int, total: int, width: int = 28) -> str:
     if total == 0:
         return "N/A"
     frac = correct / total
@@ -93,33 +137,41 @@ def accuracy_bar(correct: int, total: int, width: int = 30) -> str:
     return f"{bar}  {correct}/{total}  ({100*frac:.1f}%)"
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+def float_bar(value: float, width: int = 28) -> str:
+    """Bar for a [-1,+1] value, centred at 0."""
+    frac = (value + 1) / 2          # map [-1,1] → [0,1]
+    filled = int(frac * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{bar}  {value:+.3f}"
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--adapter",   required=True,
-                        help="Path to saved LoRA adapter dir.")
-    parser.add_argument("--data",      required=True,
-                        help="Path to dpo_pairs_combined.jsonl (full dataset).")
+    parser.add_argument("--adapter",    required=True)
+    parser.add_argument("--data",       required=True)
     parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--seed",      type=int,   default=42)
-    parser.add_argument("--output",    default="eval_offline_results.json",
-                        help="Where to write the JSON results file.")
-    parser.add_argument("--max-samples", type=int, default=0,
-                        help="Truncate val set (0=all). For quick smoke-test.")
+    parser.add_argument("--val-ratio",  type=float, default=0.1)
+    parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--output",     default="eval_sdpo_results.json")
+    parser.add_argument("--max-samples", type=int,  default=0)
     args = parser.parse_args()
 
-    # ── Load val split ───────────────────────────────────────────────────────
+    # ── Load data ────────────────────────────────────────────────────────────
     print(f"Loading val split from {args.data} ...")
     val_pairs = load_val_split(args.data, args.val_ratio, args.seed)
     if args.max_samples > 0:
         val_pairs = val_pairs[:args.max_samples]
     print(f"Val set size: {len(val_pairs)}")
-    print(f"Oracle mode distribution: "
-          f"{dict(Counter(oracle_mode(p) for p in val_pairs))}")
+    outcome_dist = Counter(p.get("meta", {}).get("outcome", "?") for p in val_pairs)
+    print(f"Outcome distribution: {dict(outcome_dist)}")
 
     # ── Load router ──────────────────────────────────────────────────────────
+    try:
+        from LLMRouter.router_inference import LLMRouter
+    except ModuleNotFoundError:
+        from router_inference import LLMRouter
     print(f"\nLoading LLMRouter from {args.adapter} ...")
     router = LLMRouter(adapter_path=args.adapter, base_model=args.base_model)
 
@@ -127,158 +179,90 @@ def main():
     print(f"\nRunning inference on {len(val_pairs)} samples ...")
     results = []
     for i, pair in enumerate(val_pairs):
-        prompt_text = extract_prompt_text(pair)
-        oracle_m    = oracle_mode(pair)
-        oracle_na   = oracle_n(pair)
-        coarse      = pair["meta"].get("coarse_type", "?")
-        source      = pair["meta"].get("source", "MAST")
+        outcome   = pair.get("meta", {}).get("outcome", "?")
+        coarse    = pair.get("meta", {}).get("coarse_type", "?")
+        chosen    = pair["chosen"]
+        rejected  = pair["rejected"]
 
-        # Feed the raw prompt directly to the model (no cheating)
-        # LLMRouter.route() builds its own messages, so we call the model
-        # directly using the same tokenizer + generate pipeline.
-        from transformers import AutoTokenizer
-        try:
-            from LLMRouter.train_dpo import SYSTEM_PROMPT
-        except ModuleNotFoundError:
-            from train_dpo import SYSTEM_PROMPT
+        raw = run_inference(pair, router)
 
-        messages = [
-            {"role": "system",  "content": SYSTEM_PROMPT},
-            {"role": "user",    "content": prompt_text},
-        ]
-        text = router.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        import torch
-        inputs = router.tokenizer(text, return_tensors="pt",
-                                  truncation=True, max_length=1024).to(router.model.device)
-        with torch.inference_mode():
-            outputs = router.model.generate(
-                **inputs,
-                max_new_tokens=256,
-                temperature=0.1,
-                do_sample=False,         # greedy for determinism in eval
-                pad_token_id=router.tokenizer.pad_token_id,
-            )
-        new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-        raw = router.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        fv  = format_valid(raw)
+        cs  = containment_score(raw)
+        sim_chosen   = jaccard(raw, chosen)
+        sim_rejected = jaccard(raw, rejected)
+        prefer_chosen = sim_chosen > sim_rejected
 
-        # Parse and repair
-        raw_parsed = None
-        try:
-            raw_parsed = json.loads(raw.strip())
-        except Exception:
-            pass
-        repaired = parse_routing_decision(raw)
-
-        pred_mode = repaired["collaboration_mode"]
-        pred_na   = repaired["num_agents"]
-        was_repaired = (raw_parsed is None or
-                        raw_parsed.get("collaboration_mode") != pred_mode or
-                        raw_parsed.get("num_agents") != pred_na)
-
-        mode_correct   = (pred_mode == oracle_m)
-        n_correct      = (pred_na   == oracle_na)
-        joint_correct  = mode_correct and n_correct
+        status = "✓" if prefer_chosen else "✗"
+        print(f"  [{i+1:>3}/{len(val_pairs)}] {status}  "
+              f"outcome={outcome}  coarse={coarse}  "
+              f"fmt={'ok' if fv else 'BAD'}  "
+              f"containment={cs:+.2f}  "
+              f"sim(c={sim_chosen:.2f}, r={sim_rejected:.2f})")
 
         results.append({
-            "idx":           i,
-            "coarse_type":   coarse,
-            "source":        source,
-            "oracle_mode":   oracle_m,
-            "oracle_n":      oracle_na,
-            "pred_mode":     pred_mode,
-            "pred_n":        pred_na,
-            "mode_correct":  mode_correct,
-            "n_correct":     n_correct,
-            "joint_correct": joint_correct,
-            "was_repaired":  was_repaired,
-            "raw_output":    raw[:300],
+            "idx":             i,
+            "outcome":         outcome,
+            "coarse_type":     coarse,
+            "format_valid":    fv,
+            "containment_score": round(cs, 4),
+            "sim_chosen":      round(sim_chosen,   4),
+            "sim_rejected":    round(sim_rejected, 4),
+            "prefer_chosen":   prefer_chosen,
+            "raw_output":      raw[:400],
         })
 
-        status = "✓" if mode_correct else "✗"
-        print(f"  [{i+1:>3}/{len(val_pairs)}] {status}  "
-              f"oracle={oracle_m}/{oracle_na}  pred={pred_mode}/{pred_na}  "
-              f"coarse={coarse}  src={source}")
-
-    # ── Aggregate metrics ────────────────────────────────────────────────────
+    # ── Aggregate ────────────────────────────────────────────────────────────
     n = len(results)
-    mode_acc  = sum(r["mode_correct"]  for r in results) / n
-    n_acc     = sum(r["n_correct"]     for r in results) / n
-    joint_acc = sum(r["joint_correct"] for r in results) / n
-    repair_rate = sum(r["was_repaired"] for r in results) / n
+    n_fmt    = sum(r["format_valid"]  for r in results)
+    n_prefer = sum(r["prefer_chosen"] for r in results)
+    mean_cs  = sum(r["containment_score"] for r in results) / n
 
-    # Per-coarse accuracy
-    by_coarse: dict = defaultdict(lambda: {"correct": 0, "total": 0})
+    # Per-outcome breakdown
+    by_outcome: dict = defaultdict(lambda: {"prefer": 0, "total": 0, "cs_sum": 0.0})
     for r in results:
-        ct = r["coarse_type"]
-        by_coarse[ct]["total"] += 1
-        if r["mode_correct"]:
-            by_coarse[ct]["correct"] += 1
+        oc = r["outcome"]
+        by_outcome[oc]["total"]  += 1
+        by_outcome[oc]["cs_sum"] += r["containment_score"]
+        if r["prefer_chosen"]:
+            by_outcome[oc]["prefer"] += 1
 
-    # Confusion matrix
-    confusion: dict = {m: Counter() for m in ALL_MODES}
-    for r in results:
-        confusion[r["oracle_mode"]][r["pred_mode"]] += 1
-
-    # Mode distributions
-    oracle_dist = Counter(r["oracle_mode"] for r in results)
-    pred_dist   = Counter(r["pred_mode"]   for r in results)
-
-    # ── Print report ─────────────────────────────────────────────────────────
-    sep = "─" * 60
+    # ── Report ───────────────────────────────────────────────────────────────
+    SEP = "─" * 60
     print(f"\n{'═'*60}")
-    print(f"  OFFLINE ROUTING ACCURACY REPORT")
+    print(f"  SDPO OFFLINE EVAL — {args.adapter}")
     print(f"{'═'*60}")
-    print(f"  Val samples : {n}")
-    print(f"  Adapter     : {args.adapter}")
+    print(f"  Val samples    : {n}")
     print()
-    print(f"  Mode accuracy   : {accuracy_bar(sum(r['mode_correct']  for r in results), n)}")
-    print(f"  n_agents acc    : {accuracy_bar(sum(r['n_correct']     for r in results), n)}")
-    print(f"  Joint accuracy  : {accuracy_bar(sum(r['joint_correct'] for r in results), n)}")
-    print(f"  Repair rate     : {repair_rate*100:.1f}%  (outputs needing post-hoc fix)")
-
-    print(f"\n{sep}")
-    print("  Per-coarse-type mode accuracy:")
-    for ct, d in sorted(by_coarse.items()):
-        print(f"    {ct:25s}: {accuracy_bar(d['correct'], d['total'])}")
-
-    print(f"\n{sep}")
-    print("  Mode distribution  (oracle vs predicted):")
-    all_active = sorted(set(list(oracle_dist.keys()) + list(pred_dist.keys())))
-    print(f"  {'Mode':<15} {'Oracle':>8} {'Predicted':>10}")
-    print(f"  {'-'*35}")
-    for m in all_active:
-        o = oracle_dist.get(m, 0)
-        p = pred_dist.get(m, 0)
-        flag = "  ← missing!" if o > 0 and p == 0 else ""
-        print(f"  {m:<15} {o:>8} {p:>10}{flag}")
-
-    print(f"\n{sep}")
-    print("  Confusion matrix (oracle=rows, predicted=cols):")
+    print(f"  Format valid   : {acc_bar(n_fmt, n)}")
+    print(f"  Prefer chosen  : {acc_bar(n_prefer, n)}")
+    print(f"  Containment    : {float_bar(mean_cs)}  (mean; +1=recovery, -1=propagation)")
     print()
-    cm_str = confusion_matrix_str(confusion, ALL_MODES)
-    for line in cm_str.split("\n"):
-        print(f"    {line}")
+    print(f"{SEP}")
+    print("  Per-outcome breakdown:")
+    for oc, d in sorted(by_outcome.items()):
+        mean_oc = d["cs_sum"] / d["total"]
+        print(f"    {oc:12s}: prefer_chosen={acc_bar(d['prefer'], d['total'])}  "
+              f"containment={mean_oc:+.3f}")
+
+    print(f"\n{SEP}")
+    print("  Sample outputs (first 3):")
+    for r in results[:3]:
+        print(f"\n  ── sample {r['idx']} ({r['outcome']}, {r['coarse_type']}) ──")
+        print(f"  {r['raw_output'][:300]}")
 
     # ── Save ─────────────────────────────────────────────────────────────────
     summary = {
-        "adapter":        args.adapter,
-        "n_val_samples":  n,
-        "mode_accuracy":  round(mode_acc,  4),
-        "n_agents_acc":   round(n_acc,     4),
-        "joint_accuracy": round(joint_acc, 4),
-        "repair_rate":    round(repair_rate, 4),
-        "per_coarse_accuracy": {
-            ct: round(d["correct"] / d["total"], 4)
-            for ct, d in by_coarse.items()
-        },
-        "oracle_mode_dist":    dict(oracle_dist),
-        "predicted_mode_dist": dict(pred_dist),
-        "confusion_matrix": {
-            oracle_m: dict(pred_counts)
-            for oracle_m, pred_counts in confusion.items()
-            if any(pred_counts.values())
+        "adapter":           args.adapter,
+        "n_val_samples":     n,
+        "format_valid_rate": round(n_fmt    / n, 4),
+        "prefer_chosen_rate": round(n_prefer / n, 4),
+        "mean_containment_score": round(mean_cs, 4),
+        "per_outcome": {
+            oc: {
+                "prefer_chosen_rate": round(d["prefer"] / d["total"], 4),
+                "mean_containment":   round(d["cs_sum"] / d["total"], 4),
+            }
+            for oc, d in by_outcome.items()
         },
         "per_sample": results,
     }
@@ -288,20 +272,17 @@ def main():
     print(f"\n  Full results → {out_path}")
     print(f"{'═'*60}\n")
 
-    # ── Suggestions based on results ─────────────────────────────────────────
+    # ── Diagnostics ──────────────────────────────────────────────────────────
     print("  DIAGNOSTIC NOTES:")
-    if mode_acc < 0.6:
-        print("  ⚠  Mode accuracy < 60% — consider re-training with more epochs or "
-              "adding chain-of-thought rationale to the prompt.")
-    missing = [m for m in ["Chain","FullConnected","Debate","Reflection"]
-               if pred_dist.get(m, 0) == 0]
-    if missing:
-        print(f"  ⚠  Model never predicts: {missing}. "
-              "Check training data balance for these modes.")
-    if repair_rate > 0.3:
-        print("  ⚠  High repair rate (>30%) — model output format is unreliable. "
-              "Consider adding few-shot JSON examples to the system prompt.")
-    if mode_acc >= 0.75 and not missing:
+    if n_fmt / n < 0.7:
+        print("  ⚠  <70% format valid — model output is not following Step N (Role): format.")
+        print("     Consider adding few-shot step examples to the system prompt.")
+    if n_prefer / n < 0.55:
+        print("  ⚠  prefer_chosen < 55% — model output is closer to rejected than chosen.")
+        print("     More epochs or a higher beta may help.")
+    if mean_cs < 0.0:
+        print("  ⚠  Negative mean containment score — outputs lean toward propagation language.")
+    if n_prefer / n >= 0.65 and mean_cs > 0.1 and n_fmt / n >= 0.8:
         print("  ✓  Routing looks healthy — proceed to end-to-end eval (Milestone 2).")
 
 
