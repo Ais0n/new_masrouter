@@ -54,12 +54,13 @@ from trl import DPOConfig, DPOTrainer
 DEFAULT_MODEL   = "Qwen/Qwen3-4B-Instruct-2507"
 DEFAULT_OUTPUT  = "checkpoints/llm_router_dpo"
 SYSTEM_PROMPT   = (
-    "You are an expert MAS routing advisor. "
-    "Given a task query, a detected error state, and recent trace context, "
-    "output a single routing decision in JSON format that leads to early error containment "
-    "or fast recovery. "
-    "Your output must be valid JSON with keys: "
-    "collaboration_mode, num_agents, llms, rationale."
+    "You are an expert multi-agent system (MAS) routing advisor. "
+    "Given a task query, an annotated agent trajectory that ends at an error trigger step, "
+    "and the detected error pattern, continue the trajectory for 2–4 agent turns. "
+    "Show what the agents do next: either containing/correcting the error (good routing) "
+    "or passing it along unchecked (bad routing). "
+    "Write actual agent turns in the format: Step N (RoleName): <agent output>. "
+    "Do not output JSON or routing configuration fields."
 )
 
 # ── LoRA target modules for Qwen3.x ─────────────────────────────────────────────
@@ -205,9 +206,22 @@ def train(args):
     if args.smoke_test:
         # Manufacture 4 fake pairs so the training loop can run
         fake_pair = {
-            "prompt": "Test query about MAS routing.",
-            "chosen":  '{"collaboration_mode":"Chain","num_agents":2,"llms":["openai/gpt-4o-mini","google/gemini-2.0-flash-001"],"rationale":"Verification step contains error."}',
-            "rejected": '{"collaboration_mode":"IO","num_agents":1,"llms":["meta-llama/llama-3.1-70b-instruct"],"rationale":"Single agent propagates error."}',
+            "prompt": (
+                "[Task Query]\nWhat is 2+2?\n\n"
+                "[Agent Trajectory]\nStep 1 (Orchestrator): Delegating to math agent.\n"
+                "Step 2 (MathAgent): The answer is 5.  ← ERROR TRIGGER\n\n"
+                "[Error Pattern]\nCode: M1.1 (Disobey-Task-Specification)\n"
+                "Coarse type: spec-violation  |  Severity: medium\n"
+                "Explanation: MathAgent produced an incorrect answer."
+            ),
+            "chosen": (
+                "Step 3 (VerifierAgent): I checked MathAgent's output. 2+2=4, not 5. Correcting.\n"
+                "Step 4 (Orchestrator): Final answer: 4."
+            ),
+            "rejected": (
+                "Step 3 (Orchestrator): Received answer 5 from MathAgent. Finalizing.\n"
+                "Step 4 (OutputAgent): The answer is 5."
+            ),
             "meta": {"coarse_type": "spec-violation", "outcome": "standalone", "severity_label": "medium"},
         }
         pairs = [fake_pair] * 4
@@ -334,8 +348,8 @@ def main():
     parser.add_argument("--per-device-batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8,
                         help="Gradient accumulation steps. Effective batch = per_device × grad_accum.")
-    parser.add_argument("--max-length",        type=int, default=2048)
-    parser.add_argument("--max-prompt-length", type=int, default=1800)
+    parser.add_argument("--max-length",        type=int, default=4096)
+    parser.add_argument("--max-prompt-length", type=int, default=3200)
 
     # Hardware
     parser.add_argument("--deepspeed", default=None,
