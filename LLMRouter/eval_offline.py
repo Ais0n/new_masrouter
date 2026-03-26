@@ -2,37 +2,36 @@
 """
 Offline Evaluation for SDPO v3 LLMRouter.
 
-In SDPO v3 chosen/rejected are plain trajectory-segment strings, not routing
-config JSON.  This script evaluates whether the fine-tuned model generates
-trajectory continuations that look like the CHOSEN (containment) side rather
-than the REJECTED (propagation) side.
-
 Metrics
 ───────
   format_valid    – output contains at least one "Step N (Role):" line
-  containment_kw  – output uses recovery language (verifier catching error)
-                    vs propagation language (passing error unchanged)
-  prefer_chosen   – output is lexically closer to chosen than rejected
-                    (bigram Jaccard similarity)
-  repair_rate     – fraction of outputs that were empty or malformed
+  judge_correct   – GPT-4o-mini judges whether the output shows CONTAINMENT or
+                    PROPAGATION; compared to the ground-truth outcome label
+                    (standalone/received → expect containment;
+                     propagated → expect recovery/containment)
+  containment_kw  – keyword heuristic: recovery words vs propagation words
+                    in [-1, +1]; used as a cheap backup when no judge key
 
 Usage (run from masrouter/):
   python LLMRouter/eval_offline.py \\
     --adapter  checkpoints/llm_router_sdpo_v3/final \\
     --data     ../MAST-Data/output/dpo_pairs/sdpo_pairs_v3.jsonl \\
-    [--val-ratio 0.1] [--seed 42] [--output eval_sdpo_results.json]
+    [--judge-model openai/gpt-4o-mini] \\
+    [--judge-key  $OPENROUTER_API_KEY] \\
+    [--no-judge] [--val-ratio 0.1] [--seed 42] [--output eval_sdpo_results.json]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
-import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 try:
     from LLMRouter.train_dpo import SYSTEM_PROMPT
@@ -40,21 +39,63 @@ except ModuleNotFoundError:
     from train_dpo import SYSTEM_PROMPT
 
 
-# ── Text-similarity helpers ────────────────────────────────────────────────────
+# ── LLM-as-judge ──────────────────────────────────────────────────────────────
 
-def bigrams(text: str) -> set:
-    tokens = re.findall(r"\w+", text.lower())
-    return set(zip(tokens, tokens[1:])) if len(tokens) > 1 else set()
+JUDGE_SYSTEM = (
+    "You are evaluating a multi-agent system trajectory continuation. "
+    "Your only job is to classify whether the trajectory shows ERROR CONTAINMENT "
+    "(an agent catches, flags, or corrects the error before it reaches the final output) "
+    "or ERROR PROPAGATION (the error passes through agents unchanged and reaches the output). "
+    'Reply with exactly one word: "containment" or "propagation".'
+)
+
+JUDGE_USER_TMPL = """\
+[Error pattern]: {error_pattern}
+[Trajectory continuation to classify]:
+{output}
+"""
 
 
-def jaccard(a: str, b: str) -> float:
-    ba, bb = bigrams(a), bigrams(b)
-    if not ba and not bb:
-        return 0.0
-    return len(ba & bb) / len(ba | bb)
+def judge_one(output: str, error_pattern: str,
+              model: str, api_key: str,
+              retries: int = 3) -> Optional[str]:
+    """Call OpenRouter to judge containment vs propagation. Returns 'containment'/'propagation'/None."""
+    import requests
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model":       model,
+        "messages": [
+            {"role": "system", "content": JUDGE_SYSTEM},
+            {"role": "user",   "content": JUDGE_USER_TMPL.format(
+                error_pattern=error_pattern,
+                output=output[:800],
+            )},
+        ],
+        "max_tokens":  5,
+        "temperature": 0.0,
+    }
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers, json=payload, timeout=30,
+            )
+            resp.raise_for_status()
+            verdict = resp.json()["choices"][0]["message"]["content"].strip().lower()
+            if "containment" in verdict:
+                return "containment"
+            if "propagation" in verdict:
+                return "propagation"
+            return None
+        except Exception as e:
+            time.sleep(2 ** attempt)
+    return None
 
 
-# ── SDPO-specific metrics ──────────────────────────────────────────────────────
+# ── Keyword fallback ───────────────────────────────────────────────────────────
 
 STEP_RE = re.compile(r"Step\s+\d+\s*\(", re.IGNORECASE)
 
@@ -62,9 +103,8 @@ CONTAINMENT_KW = {
     "verify", "verif", "correct", "correcting", "correction", "fix", "fixing",
     "catch", "catching", "detect", "error caught", "mistake", "wrong answer",
     "re-check", "recheck", "review", "confirms", "accurate", "confirmed",
-    "right answer", "actual answer", "should be",
+    "right answer", "actual answer", "should be", "incorrect",
 }
-
 PROPAGATION_KW = {
     "passes", "passing", "forwarding", "forward", "unchanged",
     "submit", "submitting", "final answer", "finaliz", "output the answer",
@@ -74,21 +114,19 @@ PROPAGATION_KW = {
 
 
 def containment_score(text: str) -> float:
-    """
-    +1 for each containment keyword hit, -1 for each propagation keyword hit.
-    Normalised to [-1, +1]. +1 = pure containment, -1 = pure propagation.
-    """
     t = text.lower()
     pos = sum(1 for kw in CONTAINMENT_KW if kw in t)
     neg = sum(1 for kw in PROPAGATION_KW if kw in t)
     total = pos + neg
-    if total == 0:
-        return 0.0
-    return (pos - neg) / total
+    return 0.0 if total == 0 else (pos - neg) / total
 
 
 def format_valid(text: str) -> bool:
     return bool(STEP_RE.search(text or ""))
+
+
+# Outcomes where the model SHOULD generate containment
+CONTAINMENT_EXPECTED = {"standalone", "received"}
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -126,22 +164,19 @@ def run_inference(pair: dict, router) -> str:
     return router.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
-# ── Accuracy bar ──────────────────────────────────────────────────────────────
+# ── Display helpers ────────────────────────────────────────────────────────────
 
 def acc_bar(correct: int, total: int, width: int = 28) -> str:
     if total == 0:
         return "N/A"
     frac = correct / total
-    filled = int(frac * width)
-    bar = "█" * filled + "░" * (width - filled)
+    bar = "█" * int(frac * width) + "░" * (width - int(frac * width))
     return f"{bar}  {correct}/{total}  ({100*frac:.1f}%)"
 
 
 def float_bar(value: float, width: int = 28) -> str:
-    """Bar for a [-1,+1] value, centred at 0."""
-    frac = (value + 1) / 2          # map [-1,1] → [0,1]
-    filled = int(frac * width)
-    bar = "█" * filled + "░" * (width - filled)
+    frac = (value + 1) / 2
+    bar = "█" * int(frac * width) + "░" * (width - int(frac * width))
     return f"{bar}  {value:+.3f}"
 
 
@@ -149,14 +184,24 @@ def float_bar(value: float, width: int = 28) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--adapter",    required=True)
-    parser.add_argument("--data",       required=True)
-    parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--val-ratio",  type=float, default=0.1)
-    parser.add_argument("--seed",       type=int,   default=42)
-    parser.add_argument("--output",     default="eval_sdpo_results.json")
-    parser.add_argument("--max-samples", type=int,  default=0)
+    parser.add_argument("--adapter",      required=True)
+    parser.add_argument("--data",         required=True)
+    parser.add_argument("--base-model",   default="Qwen/Qwen3-4B-Instruct-2507")
+    parser.add_argument("--val-ratio",    type=float, default=0.1)
+    parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--output",       default="eval_sdpo_results.json")
+    parser.add_argument("--max-samples",  type=int,   default=0)
+    parser.add_argument("--judge-model",  default="openai/gpt-4o-mini")
+    parser.add_argument("--judge-key",
+                        default=os.getenv("OPENROUTER_API_KEY", ""),
+                        help="OpenRouter API key for LLM-as-judge (or set OPENROUTER_API_KEY).")
+    parser.add_argument("--no-judge",     action="store_true",
+                        help="Skip LLM judge; use keyword heuristic only.")
     args = parser.parse_args()
+
+    use_judge = not args.no_judge and bool(args.judge_key)
+    if not use_judge:
+        print("LLM judge disabled — using keyword heuristic only.")
 
     # ── Load data ────────────────────────────────────────────────────────────
     print(f"Loading val split from {args.data} ...")
@@ -164,8 +209,7 @@ def main():
     if args.max_samples > 0:
         val_pairs = val_pairs[:args.max_samples]
     print(f"Val set size: {len(val_pairs)}")
-    outcome_dist = Counter(p.get("meta", {}).get("outcome", "?") for p in val_pairs)
-    print(f"Outcome distribution: {dict(outcome_dist)}")
+    print(f"Outcome dist : {dict(Counter(p['meta'].get('outcome','?') for p in val_pairs))}")
 
     # ── Load router ──────────────────────────────────────────────────────────
     try:
@@ -175,29 +219,44 @@ def main():
     print(f"\nLoading LLMRouter from {args.adapter} ...")
     router = LLMRouter(adapter_path=args.adapter, base_model=args.base_model)
 
-    # ── Inference ────────────────────────────────────────────────────────────
+    # ── Inference + evaluation ───────────────────────────────────────────────
     print(f"\nRunning inference on {len(val_pairs)} samples ...")
     results = []
     for i, pair in enumerate(val_pairs):
-        outcome   = pair.get("meta", {}).get("outcome", "?")
-        coarse    = pair.get("meta", {}).get("coarse_type", "?")
-        chosen    = pair["chosen"]
-        rejected  = pair["rejected"]
+        meta         = pair.get("meta", {})
+        outcome      = meta.get("outcome", "?")
+        coarse       = meta.get("coarse_type", "?")
+        error_code   = meta.get("error_code", "?")
+        expect_containment = outcome in CONTAINMENT_EXPECTED
 
         raw = run_inference(pair, router)
 
-        fv  = format_valid(raw)
-        cs  = containment_score(raw)
-        sim_chosen   = jaccard(raw, chosen)
-        sim_rejected = jaccard(raw, rejected)
-        prefer_chosen = sim_chosen > sim_rejected
+        fv = format_valid(raw)
+        cs = containment_score(raw)
 
-        status = "✓" if prefer_chosen else "✗"
+        # LLM judge
+        judge_verdict = None
+        judge_correct = None
+        if use_judge:
+            judge_verdict = judge_one(
+                raw,
+                error_pattern=f"{error_code} ({coarse})",
+                model=args.judge_model,
+                api_key=args.judge_key,
+            )
+            if judge_verdict is not None:
+                judge_correct = (judge_verdict == "containment") == expect_containment
+
+        # Keyword fallback correctness (for display when no judge)
+        kw_correct = (cs >= 0) == expect_containment
+
+        correct_flag = judge_correct if judge_correct is not None else kw_correct
+        status = "✓" if correct_flag else "✗"
+        judge_str = f"judge={judge_verdict}" if judge_verdict else f"kw_correct={'Y' if kw_correct else 'N'}"
         print(f"  [{i+1:>3}/{len(val_pairs)}] {status}  "
               f"outcome={outcome}  coarse={coarse}  "
               f"fmt={'ok' if fv else 'BAD'}  "
-              f"containment={cs:+.2f}  "
-              f"sim(c={sim_chosen:.2f}, r={sim_rejected:.2f})")
+              f"cs={cs:+.2f}  {judge_str}")
 
         results.append({
             "idx":             i,
@@ -205,62 +264,66 @@ def main():
             "coarse_type":     coarse,
             "format_valid":    fv,
             "containment_score": round(cs, 4),
-            "sim_chosen":      round(sim_chosen,   4),
-            "sim_rejected":    round(sim_rejected, 4),
-            "prefer_chosen":   prefer_chosen,
+            "judge_verdict":   judge_verdict,
+            "judge_correct":   judge_correct,
+            "kw_correct":      kw_correct,
+            "correct":         correct_flag,
             "raw_output":      raw[:400],
         })
 
     # ── Aggregate ────────────────────────────────────────────────────────────
     n = len(results)
-    n_fmt    = sum(r["format_valid"]  for r in results)
-    n_prefer = sum(r["prefer_chosen"] for r in results)
-    mean_cs  = sum(r["containment_score"] for r in results) / n
+    n_fmt     = sum(r["format_valid"] for r in results)
+    n_correct = sum(r["correct"]      for r in results)
+    mean_cs   = sum(r["containment_score"] for r in results) / n
+    n_judged  = sum(1 for r in results if r["judge_verdict"] is not None)
 
-    # Per-outcome breakdown
-    by_outcome: dict = defaultdict(lambda: {"prefer": 0, "total": 0, "cs_sum": 0.0})
+    by_outcome: dict = defaultdict(lambda: {"correct": 0, "total": 0, "cs_sum": 0.0})
     for r in results:
         oc = r["outcome"]
         by_outcome[oc]["total"]  += 1
         by_outcome[oc]["cs_sum"] += r["containment_score"]
-        if r["prefer_chosen"]:
-            by_outcome[oc]["prefer"] += 1
+        if r["correct"]:
+            by_outcome[oc]["correct"] += 1
 
     # ── Report ───────────────────────────────────────────────────────────────
-    SEP = "─" * 60
-    print(f"\n{'═'*60}")
+    SEP = "─" * 62
+    judge_label = f"judge ({n_judged}/{n} judged)" if use_judge else "kw-heuristic"
+    print(f"\n{'═'*62}")
     print(f"  SDPO OFFLINE EVAL — {args.adapter}")
-    print(f"{'═'*60}")
-    print(f"  Val samples    : {n}")
+    print(f"{'═'*62}")
+    print(f"  Val samples       : {n}")
     print()
-    print(f"  Format valid   : {acc_bar(n_fmt, n)}")
-    print(f"  Prefer chosen  : {acc_bar(n_prefer, n)}")
-    print(f"  Containment    : {float_bar(mean_cs)}  (mean; +1=recovery, -1=propagation)")
+    print(f"  Format valid      : {acc_bar(n_fmt, n)}")
+    print(f"  Correct ({judge_label:18s}): {acc_bar(n_correct, n)}")
+    print(f"  Containment score : {float_bar(mean_cs)}  (mean; +1=containment, -1=propagation)")
     print()
     print(f"{SEP}")
     print("  Per-outcome breakdown:")
     for oc, d in sorted(by_outcome.items()):
-        mean_oc = d["cs_sum"] / d["total"]
-        print(f"    {oc:12s}: prefer_chosen={acc_bar(d['prefer'], d['total'])}  "
-              f"containment={mean_oc:+.3f}")
+        exp = "→ containment expected" if oc in CONTAINMENT_EXPECTED else "→ recovery expected"
+        print(f"    {oc:14s} {exp}: {acc_bar(d['correct'], d['total'])}  "
+              f"cs={d['cs_sum']/d['total']:+.2f}")
 
     print(f"\n{SEP}")
     print("  Sample outputs (first 3):")
     for r in results[:3]:
-        print(f"\n  ── sample {r['idx']} ({r['outcome']}, {r['coarse_type']}) ──")
+        verdict = f"judge={r['judge_verdict']}" if r["judge_verdict"] else f"cs={r['containment_score']:+.2f}"
+        print(f"\n  ── sample {r['idx']} ({r['outcome']}, {r['coarse_type']}, {verdict}) ──")
         print(f"  {r['raw_output'][:300]}")
 
     # ── Save ─────────────────────────────────────────────────────────────────
     summary = {
-        "adapter":           args.adapter,
-        "n_val_samples":     n,
-        "format_valid_rate": round(n_fmt    / n, 4),
-        "prefer_chosen_rate": round(n_prefer / n, 4),
+        "adapter":              args.adapter,
+        "n_val_samples":        n,
+        "format_valid_rate":    round(n_fmt     / n, 4),
+        "correct_rate":         round(n_correct / n, 4),
+        "judge_coverage":       round(n_judged  / n, 4) if use_judge else 0.0,
         "mean_containment_score": round(mean_cs, 4),
         "per_outcome": {
             oc: {
-                "prefer_chosen_rate": round(d["prefer"] / d["total"], 4),
-                "mean_containment":   round(d["cs_sum"] / d["total"], 4),
+                "correct_rate":     round(d["correct"] / d["total"], 4),
+                "mean_containment": round(d["cs_sum"] / d["total"], 4),
             }
             for oc, d in by_outcome.items()
         },
@@ -270,19 +333,18 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     print(f"\n  Full results → {out_path}")
-    print(f"{'═'*60}\n")
+    print(f"{'═'*62}\n")
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
     print("  DIAGNOSTIC NOTES:")
     if n_fmt / n < 0.7:
-        print("  ⚠  <70% format valid — model output is not following Step N (Role): format.")
-        print("     Consider adding few-shot step examples to the system prompt.")
-    if n_prefer / n < 0.55:
-        print("  ⚠  prefer_chosen < 55% — model output is closer to rejected than chosen.")
-        print("     More epochs or a higher beta may help.")
+        print("  ⚠  <70% format valid — model is not following Step N (Role): format.")
+    if n_correct / n < 0.55:
+        print("  ⚠  Correct rate < 55% — model containment/propagation direction is off.")
+        print("     Try more epochs or higher beta.")
     if mean_cs < 0.0:
-        print("  ⚠  Negative mean containment score — outputs lean toward propagation language.")
-    if n_prefer / n >= 0.65 and mean_cs > 0.1 and n_fmt / n >= 0.8:
+        print("  ⚠  Negative mean containment score — outputs lean toward propagation.")
+    if n_correct / n >= 0.65 and mean_cs > 0.1 and n_fmt / n >= 0.8:
         print("  ✓  Routing looks healthy — proceed to end-to-end eval (Milestone 2).")
 
 
