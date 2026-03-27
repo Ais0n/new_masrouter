@@ -125,8 +125,12 @@ def format_valid(text: str) -> bool:
     return bool(STEP_RE.search(text or ""))
 
 
-# Outcomes where the model SHOULD generate containment
-CONTAINMENT_EXPECTED = {"standalone", "received"}
+# For ALL outcome types, the model should generate containment/recovery:
+#   standalone  → chosen = real containment steps   → model should continue with containment
+#   propagated  → chosen = LLM recovery steps       → model should continue with recovery
+#   received    → error arrived from upstream; chosen shows containment of the cascade
+# The outcome label tells us which side is real data, not which direction to train.
+CONTAINMENT_EXPECTED = {"standalone", "received", "propagated"}
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -246,6 +250,8 @@ def main():
             )
             if judge_verdict is not None:
                 judge_correct = (judge_verdict == "containment") == expect_containment
+            else:
+                print(f"    [judge-fail] falling back to keyword heuristic for sample {i}")
 
         # Keyword fallback correctness (for display when no judge)
         kw_correct = (cs >= 0) == expect_containment
